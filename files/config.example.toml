@@ -1,0 +1,74 @@
+# bmeoj_archive.py 公共配置示例
+#
+# 使用方法：
+#   1. 复制为同目录的 config.toml（可提交），按需修改；
+#   2. Cookie 只放在同目录的 config.local.toml 或环境变量 BMEOJ_COOKIE，绝不写进本文件。
+#   3. 发行包中本文件位于 files\，复制出的 config.toml / config.local.toml 也放在 files\。
+#
+# 优先级：命令行参数 > 环境变量 > config.local.toml > config.toml > 内置默认值。
+
+[oj]
+# OJ 根地址，末尾不要加 /。
+base_url = "http://oj.bmeonline.cn"
+
+# 请求间隔（秒）。脚本会强制不低于 1.0，默认 1.5，避免把站点打急。
+request_interval = 1.5
+
+# 单次请求超时（秒）。
+timeout = 30
+
+# 失败重试次数（不含首次）。
+retries = 3
+
+# 可选：自定义 User-Agent。
+# user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..."
+
+[archive]
+# 默认目标文件夹（双击 run.bat 时仍会提示，可直接回车采用此值）。
+directory = "output"
+
+# 目录布局：
+#   problem      -> <目标>/<cid>/<文件名>          （与旧 BME_OJ 一致，默认）
+#   submissions  -> <目标>/submissions/<文件名>
+#   flat         -> <目标>/<文件名>
+layout = "problem"
+
+# 文件名模板。可用变量：
+#   {id}         题号组 ID（cid，例如 1011）
+#   {pid}        题目在组内的序号（0 起）
+#   {part}       小题字母（A、B、C……；旧规则里的“Px”）
+#   {letter}     {part} 的别名
+#   {problem_id} OJ 全局题目编号（例如 1084）
+#   {title}      题名
+#   {slug}       题名的 ASCII slug
+#   {user}       OJ 用户名
+#   {submit_id}  提交 ID
+#   {date}       提交日期 YYYY-MM-DD
+#
+# 旧规则“<cid>\<cid> P<字母>.cpp”对应下面这行。
+# 注意：字面写成 "{id}x P{id}.cpp" 会得到 "1011x P1011.cpp"，与旧文件不一致。
+filename_template = "{id} P{part}.cpp"
+
+# latest = 每题只保留最新一次 AC；all = 保留全部 AC（等同 --all）。
+mode = "latest"
+
+# 是否允许覆盖已存在的 .cpp（等同 --overwrite）。
+overwrite = false
+
+# 是否删除 OJ 网页在代码末尾追加的 /***** 注释块（只留代码）。
+strip_footer = true
+
+# 是否在目标目录生成 LICENSE（MIT，仅覆盖工具/文档，不覆盖提交代码）。
+write_license = false
+
+[files]
+# 是否生成 manifest.csv（manifest.json 始终生成）。
+write_manifest_csv = true
+
+# 是否生成 README.md / topics.txt / repo-description.txt / .gitignore。
+write_repo_files = true
+
+[git]
+# --init-git 且本机没有配置 git 身份时，用这个邮箱后缀兜底。
+# 实际命令是 git -c user.name=... -c user.email=... commit，不写入全局配置。
+noreply_domain = "users.noreply.github.com"

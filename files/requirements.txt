@@ -1,0 +1,9 @@
+# bmeoj_archive.py 只依赖 Python 标准库，安装本文件不是运行的前提。
+#
+# 需要 Python 3.8+。若使用 TOML 配置文件：
+#   - Python 3.11+ 自带 tomllib；或
+#   - 安装 tomli（Python 3.8–3.10）：pip install tomli
+#
+# 下面两个包是可选的解析增强，不装也能运行；装了会略微提升容错：
+# requests>=2.28
+# beautifulsoup4>=4.11
