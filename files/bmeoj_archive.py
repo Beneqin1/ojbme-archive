@@ -8,7 +8,9 @@ r"""bmeoj_archive.py —— 把 oj.bmeonline.cn 上某个用户的 AC/正确提�
 * 只读 OJ：只抓取指定用户“正确/Accepted”的提交源码，不提交、不评分、不改站点。
 * 只写本地：默认增量；已有文件不覆盖，除非显式 --overwrite / --force。
 * 不自动 push、不自动创建远程仓库：--init-git 只做 git init/add/commit。
-* Cookie 只从环境变量 BMEOJ_COOKIE 或 config.local.toml 读取，绝不写入产物。
+* 鉴权：优先使用 OJ 用户名 + 密码登录（标准库 http.cookiejar 维持会话）；
+  也可配置 Cookie 作为备选。密码/Cookie 只从环境变量或 config.local.toml 读取，
+  绝不写入 config.toml、README、manifest、日志或任何提交文件。
 * 零必需第三方依赖：Python 3.8+ 标准库即可运行。
 
 用法示例
@@ -18,26 +20,29 @@ r"""bmeoj_archive.py —— 把 oj.bmeonline.cn 上某个用户的 AC/正确提�
     python bmeoj_archive.py --user 11226128 --all
     python bmeoj_archive.py --user 11226128 --force --overwrite
     python bmeoj_archive.py --user 11226128 --init-git
-    python bmeoj_archive.py --probe --user 11226128
+    python bmeoj_archive.py --probe --user 11226128 --dump-html
 
-Cookie 获取（只在你自己已登录的浏览器里操作）
-============================================
-1. 浏览器登录 http://oj.bmeonline.cn/
-2. F12 -> Network（网络）-> 刷新任意页面 -> 点一个请求
-3. 复制 Request Headers 里的 Cookie 整行（通常含 PHPSESSID=...）
-4. 任选一种方式配置：
-   * Windows CMD:  set BMEOJ_COOKIE=PHPSESSID=...
-   * PowerShell:   $env:BMEOJ_COOKIE = "PHPSESSID=..."
-   * config.local.toml:
-         [oj]
-         cookie = "PHPSESSID=..."
-   不要把 Cookie 写进 config.toml、README、命令行历史或任何会提交的文件。
+密码输入（按优先级）
+====================
+1. 环境变量 BMEOJ_PASSWORD
+2. config.local.toml 的 [oj] password（该文件已被 .gitignore 忽略）
+3. 交互式 getpass 输入（不回显；仅当标准输入是终端时）
+命令行不提供 --password，避免密码进入 shell 历史。
+
+Cookie 备选方式
+================
+若配置了 BMEOJ_COOKIE 或 config.local.toml 的 [oj] cookie，则优先使用 Cookie
+并跳过密码登录。Cookie 获取：在你自己已登录的浏览器中 F12 -> Network ->
+复制 Request Headers 的 Cookie 整行。不要把密码/Cookie 写进 config.toml、
+README、命令行历史或任何会提交的文件。
 """
 
 import argparse
 import csv
+import getpass
 import hashlib
 import html as html_lib
+import http.cookiejar
 import json
 import os
 import re
@@ -50,7 +55,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 SCHEMA_VERSION = 1
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BASE = "http://oj.bmeonline.cn"
@@ -72,6 +77,8 @@ _RESERVED_NAMES = {
 }
 
 _ACTIVE_COOKIE = ""
+_ACTIVE_SECRETS = []
+PRIVATE_AUTH_KEYS = ("cookie", "password", "passwd")
 
 
 # --------------------------------------------------------------------------- #
@@ -100,9 +107,18 @@ class UserNotFound(ArchiveError):
 # --------------------------------------------------------------------------- #
 # 基础工具
 # --------------------------------------------------------------------------- #
+def remember_secret(value):
+    """记住本次运行中的秘密，供日志脱敏使用；不写盘。"""
+    value = str(value or "")
+    if value and value not in _ACTIVE_SECRETS:
+        _ACTIVE_SECRETS.append(value)
+
+
 def redact(text):
     """日志脱敏：Cookie/Token/密码一律替换成 ***。"""
     text = str(text)
+    for secret in _ACTIVE_SECRETS:
+        text = text.replace(secret, "***")
     if _ACTIVE_COOKIE:
         text = text.replace(_ACTIVE_COOKIE, "***")
     text = re.sub(
@@ -339,7 +355,7 @@ def _find_private_key(node, prefix=""):
         for key, value in node.items():
             name = str(key).strip().lower()
             here = "%s.%s" % (prefix, key) if prefix else str(key)
-            if name in ("cookie", "password", "passwd"):
+            if name in PRIVATE_AUTH_KEYS:
                 return here
             found = _find_private_key(value, here)
             if found:
@@ -350,6 +366,19 @@ def _find_private_key(node, prefix=""):
             if found:
                 return found
     return ""
+
+
+def _strip_private_fields(node):
+    """从运行时配置里移除密码/Cookie，避免它们被误写进任何产物。"""
+    if isinstance(node, dict):
+        for key in list(node):
+            if str(key).strip().lower() in PRIVATE_AUTH_KEYS:
+                node.pop(key, None)
+            else:
+                _strip_private_fields(node[key])
+    elif isinstance(node, list):
+        for item in node:
+            _strip_private_fields(item)
 
 
 def resolve_config(args):
@@ -363,8 +392,9 @@ def resolve_config(args):
     private_key = _find_private_key(public)
     if private_key:
         raise ConfigError(
-            "config.toml 里出现了 %s。请把 Cookie 移到 config.local.toml（已被 .gitignore 忽略），"
-            "或改用环境变量 BMEOJ_COOKIE；本工具也不接受密码配置。" % private_key
+            "config.toml 里出现了 %s。密码/Cookie 属于私有凭据，请放到 "
+            "config.local.toml（已被 .gitignore 忽略）或环境变量"
+            "（BMEOJ_PASSWORD / BMEOJ_COOKIE）。" % private_key
         )
 
     # 环境变量覆盖
@@ -410,6 +440,8 @@ def resolve_config(args):
         raise ConfigError("mode 只能是 latest / all。")
     if not str(arc.get("filename_template") or "").strip():
         raise ConfigError("filename_template 不能为空。")
+    # 运行时配置不再携带密码/Cookie；鉴权代码只读取 local 原始表和进程环境变量。
+    _strip_private_fields(cfg)
     return cfg, public, local
 
 
@@ -434,6 +466,195 @@ def resolve_cookie(local_cfg, log):
     return raw, source
 
 
+def _can_prompt():
+    """非交互环境不弹密码输入，避免 CI/计划任务挂起。"""
+    if os.environ.get("BMEOJ_NO_PROMPT"):
+        return False
+    try:
+        return bool(sys.stdin.isatty())
+    except Exception:
+        return False
+
+
+def resolve_password(local_cfg, log, required=True):
+    """按环境变量 -> config.local.toml -> getpass 的顺序取密码。"""
+    raw = os.environ.get("BMEOJ_PASSWORD")
+    source = "环境变量 BMEOJ_PASSWORD"
+    if raw is None or raw == "":
+        oj = local_cfg.get("oj") if isinstance(local_cfg.get("oj"), dict) else {}
+        raw = oj.get("password")
+        source = "config.local.toml"
+        if raw is None:
+            raw = oj.get("passwd")
+            source = "config.local.toml"
+    if raw is not None:
+        raw = str(raw)
+        if raw != "":
+            remember_secret(raw)
+            return raw, source
+    if _can_prompt():
+        try:
+            raw = getpass.getpass("OJ 密码（输入不回显）: ")
+        except EOFError:
+            raise ConfigError("密码输入结束（EOF），未获得密码。")
+        if raw == "":
+            raise ConfigError("密码不能为空。")
+        remember_secret(raw)
+        return raw, "交互输入"
+    if required:
+        raise AuthError(
+            "未提供 OJ 密码，无法登录。请任选一种方式配置：\n"
+            "  * 环境变量 BMEOJ_PASSWORD\n"
+            "  * config.local.toml 的 [oj] password（已被 .gitignore 忽略）\n"
+            "  * 在交互式终端运行，让脚本用 getpass 提示输入（不回显）\n"
+            "也可以改用 Cookie 方式（BMEOJ_COOKIE / [oj] cookie）作为备选鉴权。"
+        )
+    return "", ""
+
+
+def password_digest(password):
+    """站点登录页用 hex_md5() 在浏览器端处理密码；这里做同样的 UTF-8 MD5。"""
+    return hashlib.md5(password.encode("utf-8")).hexdigest()
+
+
+# 登录表单解析：HUSTOJ 的 loginpage.php 是标准 POST 表单，字段名可能因部署而异。
+_FORM_RE = re.compile(r"(?is)<form\b([^>]*)>(.*?)</form>")
+_INPUT_RE = re.compile(r"(?is)<input\b([^>]*)>")
+_BUTTON_RE = re.compile(r"(?is)<button\b([^>]*)>")
+_SUBMIT_INPUT_RE = re.compile(r"(?is)<input\b[^>]*type\s*=\s*[\"']?submit[^>]*>")
+_ATTR_RE = re.compile(r"""([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>/]+))""")
+
+
+def _parse_attrs(text):
+    attrs = {}
+    for match in _ATTR_RE.finditer(text or ""):
+        name = match.group(1).lower()
+        value = next((item for item in match.groups()[1:] if item is not None), "")
+        attrs[name] = html_lib.unescape(value or "")
+    return attrs
+
+
+def parse_login_form(html):
+    """提取 action、用户名/密码字段、隐藏字段，并判断是否前端 MD5。"""
+    form_attrs = ""
+    form_body = html or ""
+    for attrs, body in _FORM_RE.findall(html or ""):
+        if re.search(r"type\s*=\s*[\"']?password", body, re.I) or "login" in attrs.lower():
+            form_attrs, form_body = attrs, body
+            break
+
+    attrs = _parse_attrs(form_attrs)
+    action = (attrs.get("action") or "login.php").strip() or "login.php"
+    md5 = bool(re.search(r"md5", form_attrs, re.I)) or bool(
+        re.search(r"jsMd5|hex_md5", form_body, re.I)
+    )
+    if not form_attrs:
+        md5 = bool(re.search(r"jsMd5|hex_md5", html or "", re.I))
+
+    username_field = "user_id"
+    password_field = "password"
+    hidden = {}
+    captcha = False
+    for raw in _INPUT_RE.findall(form_body):
+        field = _parse_attrs(raw)
+        name = field.get("name") or ""
+        kind = (field.get("type") or "text").lower()
+        if not name:
+            continue
+        if kind == "password":
+            password_field = name
+        elif kind == "hidden":
+            hidden[name] = field.get("value", "")
+        elif name.lower() in ("user_id", "userid", "username", "user", "name"):
+            username_field = name
+        if kind != "hidden" and re.search(r"captcha|vcode|verify", name, re.I):
+            captcha = True
+
+    for raw in _BUTTON_RE.findall(form_body) + _SUBMIT_INPUT_RE.findall(form_body):
+        field = _parse_attrs(raw)
+        name = field.get("name")
+        if name and name not in hidden:
+            hidden[name] = field.get("value") or "Login"
+
+    return {
+        "action": action,
+        "username_field": username_field,
+        "password_field": password_field,
+        "hidden": hidden,
+        "md5": md5,
+        "captcha": captcha,
+    }
+
+
+_LOGIN_FAIL_RE = re.compile(
+    r"user\s*name\s*or\s*password\s*wrong|username\s*or\s*password\s*wrong|"
+    r"password\s*(?:is\s*)?wrong|invalid\s+(?:user|password)|incorrect\s+password|"
+    r"用户名或密码错误|用户名/密码错误|密码错误|登录失败",
+    re.I,
+)
+_NO_SUCH_USER_RE = re.compile(r"no\s+such\s+user|user\s+not\s+found|用户名不存在|用户不存在", re.I)
+
+
+def login(fetcher, user, password, source, log, dump_html=False):
+    """用 OJ 用户名/密码建立会话，并在成功后验证登录态。"""
+    remember_secret(password)
+    log.step("登录：%s（密码来源：%s，值已脱敏）" % (user, source))
+    page = fetcher.get("loginpage.php", None, "登录页")
+    if dump_html:
+        fetcher.dump("loginpage.html", page)
+
+    form = parse_login_form(page)
+    if form["captcha"]:
+        raise AuthError(
+            "登录页要求验证码；本工具不绕过验证码，无法自动登录。"
+            "请先在浏览器手动登录，然后改用 Cookie 方式（BMEOJ_COOKIE / [oj] cookie）。"
+        )
+
+    payload = dict(form["hidden"])
+    payload[form["username_field"]] = user
+    if form["md5"]:
+        digest = password_digest(password)
+        remember_secret(digest)
+        payload[form["password_field"]] = digest
+    else:
+        payload[form["password_field"]] = password
+
+    # 绝不把 payload 写进日志：里面含密码或密码摘要。
+    response = fetcher.post(
+        form["action"], payload, "登录提交", referer=fetcher.url("loginpage.php")
+    )
+    if dump_html:
+        fetcher.dump("login_response.html", response)
+
+    state = check_logged_in(fetcher, dump_html=dump_html)
+    if state is True:
+        log.info("登录成功：PHPSESSID 会话已建立，并通过 modifypage.php 验证（值已脱敏）。")
+        return True
+
+    blob = (response or "") + "\n" + plain_text(response)
+    if _NO_SUCH_USER_RE.search(blob):
+        raise UserNotFound("OJ 用户名不存在：%s（登录被拒绝）。" % user)
+
+    exists = None
+    try:
+        exists, _ = check_user_exists(fetcher, user, log)
+    except ArchiveError:
+        exists = None
+    if exists is False:
+        raise UserNotFound("OJ 用户名不存在：%s（userinfo.php 返回 No such User）。" % user)
+
+    if state is False or _LOGIN_FAIL_RE.search(blob):
+        raise AuthError(
+            "OJ 登录失败：用户名或密码错误（密码来源：%s，值已脱敏）。\n"
+            "请确认 OJ 用户名和密码；连续失败可能导致账号被临时锁定。"
+            "本工具不会猜测密码、不会绕过验证码。" % source
+        )
+    raise AuthError(
+        "登录请求已提交，但无法确认登录状态（modifypage.php 页面结构未知）。\n"
+        "请用 --probe --dump-html 查看登录页/会话页结构；或改用 Cookie 方式登录。"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # HTTP
 # --------------------------------------------------------------------------- #
@@ -447,15 +668,34 @@ class Fetcher(object):
         self.user_agent = str(cfg["oj"]["user_agent"] or DEFAULT_UA)
         self.log = log
         self.calls = 0
+        # 密码登录用 CookieJar 维持 PHPSESSID；静态 Cookie 模式保持原 header 行为。
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar)
+        )
+
+    def _open(self, req):
+        if self.cookie:
+            return urllib.request.urlopen(req, timeout=self.timeout)
+        return self.opener.open(req, timeout=self.timeout)
 
     def _url(self, path, params):
         if path.startswith("http://") or path.startswith("https://"):
             url = path
         else:
+            path = path.strip()
+            while path.startswith("./"):
+                path = path[2:]
             url = self.base_url + "/" + path.lstrip("/")
         if params:
             url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
         return url
+
+    def url(self, path, params=None):
+        return self._url(path, params)
+
+    def session_cookie_names(self):
+        return sorted({cookie.name for cookie in self.jar})
 
     def get(self, path, params=None, purpose=""):
         url = self._url(path, params)
@@ -473,7 +713,7 @@ class Fetcher(object):
         for attempt in range(self.retries + 1):
             req = urllib.request.Request(url, headers=headers, method="GET")
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with self._open(req) as resp:
                     raw = resp.read()
                     charset = resp.headers.get_content_charset() or "utf-8"
                     text = raw.decode(charset, "replace")
@@ -486,8 +726,8 @@ class Fetcher(object):
                 self.calls += 1
                 if exc.code in (401, 403):
                     raise AuthError(
-                        "HTTP %s：没有权限访问 %s。Cookie 可能无效/已过期，"
-                        "或该提交不属于当前 Cookie 账号。" % (exc.code, purpose or path)
+                        "HTTP %s：没有权限访问 %s。登录状态可能无效/已过期，"
+                        "或该提交不属于当前账号。" % (exc.code, purpose or path)
                     )
                 last_error = "HTTP %s" % exc.code
             except urllib.error.URLError as exc:
@@ -506,16 +746,61 @@ class Fetcher(object):
                 time.sleep(wait)
         raise NetworkError("%s 失败：%s" % (purpose or path, last_error))
 
+    def post(self, path, data, purpose="", referer=None):
+        """提交表单；不重试，避免把同一份凭据重复发给站点。"""
+        url = self._url(path, None)
+        body = urllib.parse.urlencode(data, doseq=True).encode("utf-8")
+        headers = {
+            "User-Agent": self.user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+            "Accept-Encoding": "identity",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": referer or (self.base_url + "/"),
+            "Origin": self.base_url,
+        }
+        if self.cookie:
+            headers["Cookie"] = self.cookie
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with self._open(req) as resp:
+                raw = resp.read()
+                charset = resp.headers.get_content_charset() or "utf-8"
+                text = raw.decode(charset, "replace")
+            self.calls += 1
+            if purpose:
+                self.log.info("    已提交：%s" % purpose)
+            self._sleep()
+            return text
+        except urllib.error.HTTPError as exc:
+            self.calls += 1
+            if exc.code in (401, 403):
+                raise AuthError("HTTP %s：登录请求被拒绝（%s）。" % (exc.code, purpose or path))
+            raise NetworkError("登录请求失败：HTTP %s" % exc.code)
+        except urllib.error.URLError as exc:
+            self.calls += 1
+            raise NetworkError("登录请求网络错误：%s" % getattr(exc, "reason", exc))
+        except Exception as exc:
+            self.calls += 1
+            raise NetworkError("登录请求失败：%s: %s" % (type(exc).__name__, exc))
+
     def _sleep(self):
         # 间隔已在 resolve_config 里按站点钳制（真实站点 >=1 秒）。
         if self.interval > 0:
             time.sleep(self.interval)
 
     def dump(self, name, text):
-        os.makedirs(os.path.join(HERE, "_debug"), exist_ok=True)
         path = os.path.join(HERE, "_debug", name)
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text)
+        try:
+            os.makedirs(os.path.join(HERE, "_debug"), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(redact(text))
+        except OSError as exc:
+            self.log.warn(
+                "调试页面保存失败（%s）：%s；不影响抓取，可检查目录权限。"
+                % (rel_display(path, HERE), exc)
+            )
+            return None
         self.log.info("    调试页面已保存：%s" % rel_display(path, HERE))
         return path
 
@@ -634,17 +919,50 @@ def check_user_exists(fetcher, user, log):
     return True, nickname
 
 
-def check_logged_in(fetcher):
+_SESSION_POS_RE = re.compile(
+    r"logout\.php|name\s*=\s*[\"']?(?:oldpass|newpass)\b|change\s+password|"
+    r"old\s+password|new\s+password|modify\s+user|修改密码|修改资料|旧密码|新密码",
+    re.I,
+)
+_SESSION_NEG_RE = re.compile(
+    r"please\s+(?:login|log\s+in)|loginpage\.php|请先登录|请登录|not\s+logged\s+in",
+    re.I,
+)
+_PROFILE_SCRIPT_RE = re.compile(
+    r"(?is)<script\b[^>]*\bsrc\s*=\s*[\"']([^\"']+)[\"']", re.I
+)
+
+
+def classify_session(html, fetcher, dump_html=False):
+    """判断受保护页面是登录态还是匿名态；无法判断返回 None。"""
+    if _SESSION_POS_RE.search(html or ""):
+        return True
+    if _SESSION_NEG_RE.search(html or ""):
+        return False
+
+    # 兼容不同主题：登录入口由 template/bs3/profile.php 动态输出。
+    for src in _PROFILE_SCRIPT_RE.findall(html or ""):
+        if "profile.php" not in src.lower():
+            continue
+        try:
+            script = fetcher.get(src, None, "会话状态脚本")
+        except ArchiveError:
+            continue
+        if re.search(r"logout\.php|\bLogout\b|退出登录|注销", script, re.I):
+            return True
+        if re.search(r"loginpage\.php|\bLogin\b", script, re.I):
+            return False
+    return None
+
+
+def check_logged_in(fetcher, dump_html=False):
     try:
         html = fetcher.get("modifypage.php", None, "登录状态")
     except (NetworkError, AuthError):
         return None
-    text = plain_text(html)
-    if re.search(r"please\s+login|loginpage\.php", text, re.I):
-        return False
-    if re.search(r"logout|退出登录|注销|修改资料", html, re.I):
-        return True
-    return None
+    if dump_html:
+        fetcher.dump("modifypage_session.html", html)
+    return classify_session(html, fetcher, dump_html=dump_html)
 
 
 def fetch_problem_title(fetcher, cid, pid, log):
@@ -671,7 +989,7 @@ def fetch_source(fetcher, sid, log, dump_html=False):
         if dump_html:
             fetcher.dump("showsource_%s_no_access.html" % sid, html)
         raise AuthError(
-            "无法查看提交 %s 的源码：未登录、Cookie 失效，或该提交不属于当前账号。" % sid
+            "无法查看提交 %s 的源码：登录状态无效/已过期，或该提交不属于当前账号。" % sid
         )
 
     candidates = []
@@ -833,7 +1151,7 @@ desktop.ini
 
 _TARGET_CONFIG = """\
 # 本文件由 bmeoj_archive.py 生成，用于记录本次存档的规则。
-# 它不包含 Cookie，也不能直接用来自动同步（脚本在工具目录，不在本仓库）。
+# 它不包含密码/Cookie，也不能直接用来自动同步（脚本在工具目录，不在本仓库）。
 
 [archive]
 layout = "{layout}"
@@ -1017,11 +1335,16 @@ def write_repo_files(target, manifest, cfg, user, log):
 # git（只本地初始化，绝不 push）
 # --------------------------------------------------------------------------- #
 def _run_git(args, cwd, timeout=120):
+    env = dict(os.environ)
+    # 子进程不需要、也不应该看到本次登录的凭据。
+    env.pop("BMEOJ_PASSWORD", None)
+    env.pop("BMEOJ_COOKIE", None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
     try:
         proc = subprocess.run(
             ["git"] + args, cwd=cwd, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout,
-            env=dict(os.environ, GIT_TERMINAL_PROMPT="0"),
+            env=env,
         )
     except FileNotFoundError:
         return 127, "git 未安装或不在 PATH 中"
@@ -1296,10 +1619,64 @@ def _backup_existing(target, relpath, log):
         log.warn("备份旧文件失败：%s" % exc)
 
 
+def describe_auth(auth):
+    kind = (auth or {}).get("kind")
+    if kind == "cookie":
+        return "Cookie（来源：%s，值已脱敏）" % auth.get("source", "")
+    if kind == "password":
+        return "密码登录（来源：%s，值已脱敏）" % auth.get("source", "")
+    return "未提供（匿名）"
+
+
+def prepare_session(cfg, args, user, log, require_auth, dump_html=False):
+    """建立会话：Cookie 优先；否则密码登录；probe 允许匿名。"""
+    cookie, cookie_source = resolve_cookie(args.local_cfg, log)
+    fetcher = Fetcher(cfg["oj"]["base_url"], cookie, cfg, log)
+
+    exists, nickname = check_user_exists(fetcher, user, log)
+    if not exists:
+        raise UserNotFound("OJ 用户不存在：%s（userinfo.php 返回 No such User）" % user)
+
+    if cookie:
+        log.info("检测到 Cookie（来源：%s），优先使用 Cookie 鉴权并跳过密码登录。" % cookie_source)
+        state = check_logged_in(fetcher, dump_html=dump_html)
+        if state is False:
+            raise AuthError(
+                "Cookie 登录状态无效或已过期（modifypage.php 显示未登录）。\n"
+                "请更新 BMEOJ_COOKIE / config.local.toml 的 [oj] cookie；"
+                "如果同时配置了密码，请移除 Cookie 后重试密码登录。"
+            )
+        if state is None:
+            log.warn("无法确认 Cookie 登录状态（页面结构未知）；将继续尝试。")
+        return fetcher, {
+            "kind": "cookie",
+            "source": cookie_source,
+            "verified": state is True,
+            "nickname": nickname,
+        }
+
+    password, password_source = resolve_password(
+        args.local_cfg, log, required=require_auth
+    )
+    if not password:
+        return fetcher, {
+            "kind": "anonymous",
+            "source": "",
+            "verified": False,
+            "nickname": nickname,
+        }
+
+    login(fetcher, user, password, password_source, log, dump_html=dump_html)
+    return fetcher, {
+        "kind": "password",
+        "source": password_source,
+        "verified": True,
+        "nickname": nickname,
+    }
+
+
 def run_archive(cfg, args, user, target, log):
     base = cfg["oj"]["base_url"]
-    cookie, cookie_source = resolve_cookie(args.local_cfg, log)
-    fetcher = Fetcher(base, cookie, cfg, log)
 
     log.info("OJ：%s" % base)
     log.info("用户：%s" % user)
@@ -1307,27 +1684,17 @@ def run_archive(cfg, args, user, target, log):
     log.info("模式：%s / 布局：%s / 模板：%s" % (
         cfg["archive"]["mode"], cfg["archive"]["layout"], cfg["archive"]["filename_template"]))
     log.info("仅限本人账号或已授权账号；请遵守 OJ 服务条款与学术诚信。本工具不会 push。")
-    if cookie:
-        log.info("Cookie：已配置（来源：%s，值已脱敏）" % cookie_source)
-        logged = check_logged_in(fetcher)
-        if logged is False:
-            log.warn("Cookie 似乎无效或已过期；源码下载可能失败。请重新从浏览器复制 Cookie。")
-        elif logged is True:
-            log.info("Cookie 登录状态：正常。")
-    else:
-        log.warn("未配置 Cookie：可以列出公开提交，但下载源码需要登录。")
-        log.warn("设置方法（任选其一）：")
-        log.warn('  CMD:        set BMEOJ_COOKIE=PHPSESSID=...')
-        log.warn('  PowerShell: $env:BMEOJ_COOKIE = "PHPSESSID=..."')
-        log.warn('  config.local.toml:')
-        log.warn('      [oj]')
-        log.warn('      cookie = "PHPSESSID=..."')
-        log.warn("Cookie 不要写进 config.toml，也不要提交到仓库。")
 
-    exists, nickname = check_user_exists(fetcher, user, log)
-    if not exists:
-        raise UserNotFound("OJ 用户不存在：%s（userinfo.php 返回 No such User）" % user)
-    log.info("用户存在%s。" % ("，昵称：%s" % nickname if nickname else ""))
+    fetcher, auth = prepare_session(cfg, args, user, log, require_auth=True)
+    log.info("用户存在%s。" % ("，昵称：%s" % auth["nickname"] if auth["nickname"] else ""))
+    log.info("鉴权：%s" % describe_auth(auth))
+    if auth["kind"] == "password":
+        log.info("会话：已登录（PHPSESSID 已建立，值已脱敏；modifypage.php 验证通过）。")
+    elif auth["kind"] == "cookie":
+        if auth["verified"]:
+            log.info("Cookie 登录状态：正常（值已脱敏）。")
+        else:
+            log.warn("无法确认 Cookie 登录状态；如果源码下载失败，请更新 Cookie 或改用密码登录。")
 
     rows = fetch_all_submissions(fetcher, user, log, max_pages=args.max_pages)
     log.info("提交记录：%d 条" % len(rows))
@@ -1384,22 +1751,32 @@ def run_archive(cfg, args, user, target, log):
     os.makedirs(target, exist_ok=True)
     log.attach(os.path.join(target, "logs", "archive_%s.log" % time.strftime("%Y%m%d-%H%M%S")))
 
-    # 先全部下载到内存，再统一写盘：Cookie 失效时不会留下半套文件。
+    # 先全部下载到内存，再统一写盘：会话失效时不会留下半套文件。
     auth_errors = 0
+    session_state = None
     for index, item in enumerate(downloads, 1):
         log.step("[%d/%d] 下载 %s P%s（提交 %s）" % (
             index, len(downloads), item["cid"], item["part"], item["row"]["sid"]))
         try:
             code = fetch_source(fetcher, item["row"]["sid"], log, dump_html=args.dump_html)
-        except AuthError as exc:
+        except AuthError:
             auth_errors += 1
-            log.error(str(exc))
-            if not cookie:
+            if session_state is None:
+                session_state = check_logged_in(fetcher, dump_html=args.dump_html)
+            if session_state is False:
                 raise AuthError(
-                    "源码下载被拒绝，且当前没有配置 Cookie。\n"
-                    "请在浏览器登录 OJ 后复制 Cookie，设置环境变量 BMEOJ_COOKIE，"
-                    "或写入 config.local.toml 的 [oj] cookie。\n"
-                    "本工具不会猜测接口、不会绕过验证码或权限。"
+                    "登录状态已失效（会话过期或被站点注销），已停止下载，未写入任何提交文件。\n"
+                    "请重新运行；如果反复失效，请检查账号是否被限制登录。"
+                )
+            if session_state is True:
+                log.error(
+                    "登录成功，但 OJ 拒绝查看提交 %s 的源码：该提交可能不属于账号 %s，"
+                    "或站点限制了源码可见性。" % (item["row"]["sid"], user)
+                )
+            else:
+                log.error(
+                    "无法查看提交 %s 的源码：可能是会话失效、该提交不属于账号 %s，"
+                    "或站点限制了源码可见性。" % (item["row"]["sid"], user)
                 )
             item["action"] = "failed"
             continue
@@ -1410,7 +1787,15 @@ def run_archive(cfg, args, user, target, log):
         item["code"] = clean_code(code, item["strip_footer"])
 
     if downloads and auth_errors == len(downloads):
-        raise AuthError("所有源码下载都被拒绝，请检查 Cookie 是否属于该用户、是否已过期。")
+        if session_state is True:
+            raise AuthError(
+                "登录成功，但所有源码下载都被 OJ 拒绝：账号 %s 可能无权查看这些提交，"
+                "或站点限制了源码可见性。" % user
+            )
+        raise AuthError(
+            "所有源码下载都被拒绝：登录状态可能已失效，或账号 %s 无权查看这些提交。"
+            % user
+        )
 
     written = 0
     updated = 0
@@ -1466,26 +1851,28 @@ def run_archive(cfg, args, user, target, log):
 # --------------------------------------------------------------------------- #
 def run_probe(cfg, args, user, log):
     base = cfg["oj"]["base_url"]
-    cookie, source = resolve_cookie(args.local_cfg, log)
-    fetcher = Fetcher(base, cookie, cfg, log)
 
     log.info("=== BME OJ 探测模式 ===")
     log.info("OJ：%s" % base)
     log.info("用户：%s" % user)
-    log.info("Cookie：%s" % ("已配置（%s，值已脱敏）" % source if cookie else "未配置"))
     log.info("请求间隔：%.1f 秒；超时：%.0f 秒；重试：%d" % (
-        fetcher.interval, fetcher.timeout, fetcher.retries))
+        cfg["oj"]["request_interval"], cfg["oj"]["timeout"], cfg["oj"]["retries"]))
     log.info("")
 
-    try:
-        exists, nickname = check_user_exists(fetcher, user, log)
-    except ArchiveError as exc:
-        log.error("用户信息请求失败：%s" % exc)
-        return 3
-    if not exists:
-        log.error("用户不存在：%s" % user)
-        return 5
-    log.info("用户存在：%s%s" % (user, "（%s）" % nickname if nickname else ""))
+    fetcher, auth = prepare_session(
+        cfg, args, user, log, require_auth=False, dump_html=args.dump_html
+    )
+    log.info("用户存在：%s%s" % (user, "（%s）" % auth["nickname"] if auth["nickname"] else ""))
+    log.info("鉴权：%s" % describe_auth(auth))
+    if auth["kind"] == "password":
+        log.info("会话状态：已登录（PHPSESSID 已建立，值已脱敏；modifypage.php 验证通过）。")
+    elif auth["kind"] == "cookie":
+        if auth["verified"]:
+            log.info("会话状态：已登录（复用 Cookie，值已脱敏；modifypage.php 验证通过）。")
+        else:
+            log.warn("会话状态：无法确认 Cookie 是否有效（页面结构未知）。")
+    else:
+        log.warn("会话状态：未登录（未提供密码/Cookie）。源码页预计不可读。")
 
     try:
         html = fetcher.get("status.php", {"user_id": user}, "提交列表（探测）")
@@ -1515,10 +1902,18 @@ def run_probe(cfg, args, user, log):
             cleaned = clean_code(code, cfg["archive"].get("strip_footer", True))
             log.info("源码可读：原始 %d 字符，清洗后 %d 字符。" % (len(code), len(cleaned)))
             log.info("首行：%s" % (cleaned.splitlines()[0] if cleaned.splitlines() else ""))
-        except AuthError as exc:
-            log.warn(str(exc))
-            log.warn("这是预期结果：未配置 Cookie，或 Cookie 不属于该账号。")
-            log.warn("请在浏览器登录后复制 Cookie 到 BMEOJ_COOKIE / config.local.toml。")
+        except AuthError:
+            if auth["kind"] == "anonymous":
+                log.warn("源码不可读：当前未登录（未提供密码/Cookie）。")
+            elif auth["kind"] == "cookie" and not auth["verified"]:
+                log.warn("源码不可读：无法确认 Cookie 登录状态，源码页拒绝了请求。")
+            else:
+                log.warn(
+                    "登录成功，但 OJ 拒绝查看提交 %s 的源码：该提交可能不属于账号 %s，"
+                    "或站点限制了源码可见性。" % (target_row["sid"], user)
+                )
+            if auth["kind"] != "password" and not auth.get("verified"):
+                log.warn("如需验证登录，请配置 BMEOJ_PASSWORD 或 BMEOJ_COOKIE 后重试。")
         except ArchiveError as exc:
             log.error("源码页解析失败：%s" % exc)
             return 3
@@ -1542,7 +1937,7 @@ def build_parser():
             "  python bmeoj_archive.py --user 11226128 --dir output\n"
             "  python bmeoj_archive.py --all --force --overwrite\n"
             "  python bmeoj_archive.py --init-git\n"
-            "  python bmeoj_archive.py --probe --user 11226128\n"
+            "  python bmeoj_archive.py --probe --user 11226128 --dump-html\n"
         ),
     )
     parser.add_argument("--user", "-u", help="OJ 用户名；不填则交互提示。")
@@ -1553,7 +1948,7 @@ def build_parser():
     parser.add_argument("--init-git", action="store_true", help="只在本地 git init/add/commit，不 push。")
     parser.add_argument("--license", action="store_true", help="生成 LICENSE（MIT，仅覆盖工具/文档）。")
     parser.add_argument("--dry-run", action="store_true", help="只列计划，不下载、不写文件。")
-    parser.add_argument("--probe", action="store_true", help="探测页面结构 / 检查 Cookie，不写提交。")
+    parser.add_argument("--probe", action="store_true", help="验证登录/检查页面结构，不写提交。")
     parser.add_argument("--dump-html", action="store_true", help="解析失败时把 HTML 存到 _debug/。")
     parser.add_argument("--sid", type=int, help="--probe 时指定要测试的提交 ID。")
     parser.add_argument("--limit", type=int, default=0, help="只处理前 N 道题（调试用，0=全部）。")
@@ -1596,8 +1991,11 @@ def ask_missing(args, require_dir=True):
 
 
 def main(argv=None):
+    global _ACTIVE_COOKIE
     parser = build_parser()
     args = parser.parse_args(argv)
+    _ACTIVE_COOKIE = ""
+    del _ACTIVE_SECRETS[:]
 
     # --help / --version 已在 argparse 内处理；这里再做依赖与版本检查。
     if sys.version_info < (3, 8):

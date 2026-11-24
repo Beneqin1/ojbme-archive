@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""离线端到端测试：用本地 mock OJ 验证抓取、去重、增量、生成文件和 git 行为。
+"""离线端到端测试：用本地 mock OJ 验证密码/Cookie 登录、抓取、去重、增量、生成文件和 git 行为。
 
 运行：
     python -m unittest discover -s tests -v
     python tests/test_offline.py
 """
 
+import hashlib
 import io
 import json
 import os
@@ -19,6 +20,7 @@ import unittest
 import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +36,22 @@ else:
 import bmeoj_archive as archive  # noqa: E402
 
 COOKIE = "PHPSESSID=test-cookie"
+PASSWORD = "s3cret-pass"
+LOGIN_SESSION = "PHPSESSID=sess-alice"
+LOGIN_PAGE = """<!DOCTYPE html><html><body>
+<form id="login" action="login.php" method="post" role="form" onSubmit="return jsMd5();">
+  <input type="text" name="user_id" class="form-control">
+  <input type="password" name="password" class="form-control">
+  <button type="submit" name="submit" value="Login">Login</button>
+</form>
+<script src="include/md5-min.js"></script>
+<script>function jsMd5() { $("input[name=password]").val(hex_md5($("input[name=password]").val())); return true; }</script>
+</body></html>"""
+LOGIN_FAIL = "<script language='javascript'>alert('UserName or Password Wrong!'); history.go(-1);</script>"
+
+
+def logged_in(cookie):
+    return LOGIN_SESSION in cookie or COOKIE in cookie
 
 
 def row_html(sid, cid, pid, result_code, result_text, language, submitted_at, problem_no):
@@ -82,19 +100,43 @@ class MockOJHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def _send(self, body, code=200):
+    def _send(self, body, code=200, headers=None):
         data = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(data)
+
+    def _is_logged_in(self):
+        return bool(self.server.session_valid) and logged_in(self.headers.get("Cookie", ""))
+
+    def _deny_source(self):
+        return self._send("<html><body>I am sorry, You could not view this code!</body></html>")
 
     def do_GET(self):
         self.server.requests.append(self.path)
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
-        cookie = self.headers.get("Cookie", "")
+
+        if parsed.path == "/loginpage.php":
+            return self._send(LOGIN_PAGE)
+
+        if parsed.path == "/login.php":
+            return self._send(LOGIN_FAIL)
+
+        if parsed.path == "/template/bs3/profile.php":
+            if self._is_logged_in():
+                return self._send(
+                    'document.write("<li><a href=logout.php>Logout</a></li>");'
+                    'document.getElementById("profile").innerHTML="Logout";'
+                )
+            return self._send(
+                'document.write("<li><a href=loginpage.php>Login</a></li>");'
+                'document.getElementById("profile").innerHTML="Login";'
+            )
 
         if parsed.path == "/userinfo.php":
             user = (query.get("user") or [""])[0]
@@ -125,18 +167,50 @@ class MockOJHandler(BaseHTTPRequestHandler):
             return self._send("<html><body><h2>Problem %s: %s</h2></body></html>" % (letter, title))
 
         if parsed.path == "/showsource.php":
-            if cookie != COOKIE:
-                return self._send("<html><body>I am sorry, You could not view this code!</body></html>")
+            if not self._is_logged_in():
+                return self._deny_source()
+            if self.server.expire_on_first_source:
+                self.server.session_valid = False
+                self.server.expire_on_first_source = False
+                return self._deny_source()
             import html as html_lib
 
             return self._send("<html><body><pre>%s</pre></body></html>" % html_lib.escape(SOURCE_CODE))
 
         if parsed.path == "/modifypage.php":
-            if cookie == COOKIE:
-                return self._send("<html><body><a href='logout.php'>Logout</a></body></html>")
-            return self._send("<html><body>Please login</body></html>")
+            if self._is_logged_in():
+                return self._send(
+                    "<html><body><a href='logout.php'>Logout</a>"
+                    "<form><input name='oldpass'><input name='newpass'></form></body></html>"
+                )
+            return self._send("<html><body><a href='loginpage.php'>Please login</a></body></html>")
+
+        if parsed.path == "/index.php":
+            return self._send("<html><body>index</body></html>")
 
         return self._send("<html><body>not found</body></html>", 404)
+
+    def do_POST(self):
+        self.server.requests.append(self.path)
+        parsed = urlparse(self.path)
+        if parsed.path != "/login.php":
+            return self._send("<html><body>not found</body></html>", 404)
+
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw = self.rfile.read(length).decode("utf-8", "replace")
+        fields = parse_qs(raw)
+        user = (fields.get("user_id") or [""])[0]
+        password = (fields.get("password") or [""])[0]
+        self.server.login_posts.append((user, password))
+
+        expected = hashlib.md5(PASSWORD.encode("utf-8")).hexdigest()
+        if user == "alice" and password == expected:
+            self.server.session_valid = True
+            return self._send(
+                "", 302,
+                {"Location": "index.php", "Set-Cookie": LOGIN_SESSION + "; Path=/"},
+            )
+        return self._send(LOGIN_FAIL)
 
 
 class OfflineTest(unittest.TestCase):
@@ -144,6 +218,9 @@ class OfflineTest(unittest.TestCase):
     def setUpClass(cls):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), MockOJHandler)
         cls.server.requests = []
+        cls.server.login_posts = []
+        cls.server.session_valid = True
+        cls.server.expire_on_first_source = False
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.base = "http://127.0.0.1:%d" % cls.server.server_address[1]
@@ -161,34 +238,53 @@ class OfflineTest(unittest.TestCase):
         os.makedirs(self.tmp)
         self.out = os.path.join(self.tmp, "output")
         self.server.requests[:] = []
+        self.server.login_posts[:] = []
+        self.server.session_valid = True
+        self.server.expire_on_first_source = False
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # ------------------------------------------------------------------ #
-    def run_main(self, extra, cookie=COOKIE, user="alice"):
+    def run_main(self, extra, cookie=COOKIE, user="alice", password=None,
+                 local_config=None):
         args = [
             "--user", user,
             "--dir", self.out,
             "--base-url", self.base,
             "--interval", "0",
             "--config", os.path.join(self.tmp, "none.toml"),
-            "--local-config", os.path.join(self.tmp, "none.local.toml"),
+            "--local-config", local_config or os.path.join(self.tmp, "none.local.toml"),
         ] + extra
-        old = os.environ.get("BMEOJ_COOKIE")
+        old_cookie = os.environ.get("BMEOJ_COOKIE")
+        old_password = os.environ.get("BMEOJ_PASSWORD")
+        old_no_prompt = os.environ.get("BMEOJ_NO_PROMPT")
         if cookie:
             os.environ["BMEOJ_COOKIE"] = cookie
         else:
             os.environ.pop("BMEOJ_COOKIE", None)
+        if password is not None:
+            os.environ["BMEOJ_PASSWORD"] = password
+        else:
+            os.environ.pop("BMEOJ_PASSWORD", None)
+        os.environ["BMEOJ_NO_PROMPT"] = "1"
         out, err = io.StringIO(), io.StringIO()
         try:
             with redirect_stdout(out), redirect_stderr(err):
                 code = archive.main(args)
         finally:
-            if old is None:
+            if old_cookie is None:
                 os.environ.pop("BMEOJ_COOKIE", None)
             else:
-                os.environ["BMEOJ_COOKIE"] = old
+                os.environ["BMEOJ_COOKIE"] = old_cookie
+            if old_password is None:
+                os.environ.pop("BMEOJ_PASSWORD", None)
+            else:
+                os.environ["BMEOJ_PASSWORD"] = old_password
+            if old_no_prompt is None:
+                os.environ.pop("BMEOJ_NO_PROMPT", None)
+            else:
+                os.environ["BMEOJ_NO_PROMPT"] = old_no_prompt
         return code, out.getvalue() + err.getvalue()
 
     def read(self, *parts):
@@ -375,6 +471,115 @@ class OfflineTest(unittest.TestCase):
         self.assertEqual(code, 0, out.getvalue())
         self.assertIn("探测完成", out.getvalue())
         self.assertFalse(os.path.exists(self.out))
+
+    def test_probe_password_login(self):
+        """--probe 也应完成密码登录并打印会话状态，且不建目标目录。"""
+        code, out = self.run_main(["--probe"], cookie=None, password=PASSWORD)
+        self.assertEqual(code, 0, out)
+        self.assertIn("登录成功", out)
+        self.assertIn("会话状态：已登录", out)
+        self.assertNotIn(PASSWORD, out)
+        self.assertEqual(len(self.server.login_posts), 1)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_invalid_cookie_returns_4_without_password_fallback(self):
+        """配置了 Cookie 就优先验证 Cookie；无效时报 4，不偷偷改用密码。"""
+        code, out = self.run_main([], cookie="PHPSESSID=expired", password=PASSWORD)
+        self.assertEqual(code, 4, out)
+        self.assertIn("Cookie 登录状态无效", out)
+        self.assertEqual(self.server.login_posts, [])
+
+    def test_parse_login_form(self):
+        form = archive.parse_login_form(LOGIN_PAGE)
+        self.assertEqual(form["action"], "login.php")
+        self.assertEqual(form["username_field"], "user_id")
+        self.assertEqual(form["password_field"], "password")
+        self.assertTrue(form["md5"])
+        self.assertFalse(form["captcha"])
+        self.assertEqual(form["hidden"].get("submit"), "Login")
+
+    def test_password_login_success_and_md5(self):
+        code, out = self.run_main([], cookie=None, password=PASSWORD)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(os.path.isfile(os.path.join(self.out, "1000", "1000 PA.cpp")))
+        self.assertIn("登录成功", out)
+        self.assertIn("会话：已登录", out)
+        self.assertNotIn(PASSWORD, out)
+        self.assertEqual(len(self.server.login_posts), 1)
+        user, submitted = self.server.login_posts[0]
+        self.assertEqual(user, "alice")
+        self.assertEqual(submitted, hashlib.md5(PASSWORD.encode("utf-8")).hexdigest())
+        self.assertNotEqual(submitted, PASSWORD)
+
+        # 密码不得出现在目标目录的任何文件（源码、README、manifest、日志）里。
+        for root, _, files in os.walk(self.out):
+            for name in files:
+                path = os.path.join(root, name)
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    self.assertNotIn(PASSWORD, fh.read(), path)
+
+    def test_password_wrong_returns_4_and_writes_nothing(self):
+        code, out = self.run_main([], cookie=None, password="wrong-pass")
+        self.assertEqual(code, 4, out)
+        self.assertIn("用户名或密码错误", out)
+        self.assertEqual(len(self.server.login_posts), 1)
+        cpp = []
+        for root, _, files in os.walk(self.out):
+            cpp.extend(name for name in files if name.endswith(".cpp"))
+        self.assertEqual(cpp, [])
+
+    def test_password_login_user_not_found(self):
+        code, out = self.run_main([], cookie=None, password=PASSWORD, user="ghost")
+        self.assertEqual(code, 5, out)
+        self.assertIn("用户不存在", out)
+        self.assertEqual(self.server.login_posts, [])
+
+    def test_session_expiry_during_download_returns_4(self):
+        self.server.expire_on_first_source = True
+        code, out = self.run_main([], cookie=None, password=PASSWORD)
+        self.assertEqual(code, 4, out)
+        self.assertIn("登录状态已失效", out)
+        cpp = []
+        for root, _, files in os.walk(self.out):
+            cpp.extend(name for name in files if name.endswith(".cpp"))
+        self.assertEqual(cpp, [])
+
+    def test_cookie_preferred_over_password(self):
+        code, out = self.run_main([], cookie=COOKIE, password=PASSWORD)
+        self.assertEqual(code, 0, out)
+        self.assertIn("优先使用 Cookie", out)
+        self.assertEqual(self.server.login_posts, [])
+
+    def test_local_config_password(self):
+        local = os.path.join(self.tmp, "config.local.toml")
+        with open(local, "w", encoding="utf-8") as fh:
+            fh.write('[oj]\npassword = "%s"\n' % PASSWORD)
+        code, out = self.run_main([], cookie=None, password=None, local_config=local)
+        self.assertEqual(code, 0, out)
+        self.assertIn("密码登录", out)
+        self.assertNotIn(PASSWORD, out)
+
+    def test_public_config_rejects_password(self):
+        cfg = os.path.join(self.tmp, "config.toml")
+        with open(cfg, "w", encoding="utf-8") as fh:
+            fh.write('[oj]\npassword = "oops"\n')
+        code, out = self.run_main(["--config", cfg])
+        self.assertEqual(code, 2, out)
+        self.assertIn("config.toml", out)
+        self.assertIn("password", out.lower())
+
+    def test_interactive_password_uses_getpass(self):
+        old = os.environ.pop("BMEOJ_PASSWORD", None)
+        try:
+            with mock.patch.object(archive, "_can_prompt", return_value=True), \
+                    mock.patch("getpass.getpass", return_value=PASSWORD) as mocked:
+                password, source = archive.resolve_password({}, None, required=True)
+        finally:
+            if old is not None:
+                os.environ["BMEOJ_PASSWORD"] = old
+        self.assertEqual(password, PASSWORD)
+        self.assertEqual(source, "交互输入")
+        mocked.assert_called_once()
 
     def test_init_git_only_local(self):
         if not shutil.which("git"):

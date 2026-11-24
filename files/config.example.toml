@@ -2,8 +2,15 @@
 #
 # 使用方法：
 #   1. 复制为同目录的 config.toml（可提交），按需修改；
-#   2. Cookie 只放在同目录的 config.local.toml 或环境变量 BMEOJ_COOKIE，绝不写进本文件。
+#   2. 密码/Cookie 只放在同目录的 config.local.toml（已被 .gitignore 忽略）
+#      或环境变量 BMEOJ_PASSWORD / BMEOJ_COOKIE，绝不写进本文件。
 #   3. 发行包中本文件位于 files\，复制出的 config.toml / config.local.toml 也放在 files\。
+#
+# 私有凭据示例（写到 config.local.toml，不要写在这里）：
+#   [oj]
+#   password = "你的 OJ 密码"
+#   # 或者用浏览器 Cookie 备选（Cookie 优先于密码）：
+#   # cookie = "PHPSESSID=..."
 #
 # 优先级：命令行参数 > 环境变量 > config.local.toml > config.toml > 内置默认值。
 

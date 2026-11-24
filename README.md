@@ -3,17 +3,17 @@
 把 [oj.bmeonline.cn](http://oj.bmeonline.cn) 上**你自己账号（或已获授权账号）**的正确（Accepted / AC）提交源码抓取到本地，按题目去重、命名，并生成一个可以直接 `git init`、上传到 GitHub 的项目目录。
 
 > 本工具**不会**执行 `git push`，**不会**执行 `gh repo create`，**不会**创建或修改任何远程仓库。
-> 它只读取 OJ 的公开页面和你提供的 Cookie，只写本地文件。
+> 它用你提供的 OJ 用户名和密码（或备选 Cookie）建立会话，只读取 OJ 页面、只写本地文件。
 
 ---
 
 ## 安全边界（请先读）
 
 1. **只抓取本人账号或已明确授权的提交。** 不要用它批量下载他人的代码。
-2. **不绕过登录、验证码、权限控制。** 源码页需要登录时，工具只会提示你配置 Cookie；不会猜接口、不会伪造权限。
+2. **不绕过登录、验证码、权限控制。** 工具用你的凭据正常登录；登录失败、验证码、源码被拒都会明确报错退出。它不会猜接口、不会伪造权限。
 3. **不自动公开他人代码。** 生成的仓库默认在本地；是否上传、仓库设为公开还是私有，由你手动决定。
 4. **遵守 OJ 服务条款、课程要求和学术诚信规范。** 提交源码的版权归原作者/题目提供方，本工具不主张版权。
-5. **Cookie 等同密码。** 不要把它写进 `config.toml`、README、命令行历史、截图或任何会提交的文件。
+5. **密码和 Cookie 等同凭据。** 不要把它们写进 `config.toml`、README、manifest、日志、命令行历史、截图或任何会提交的文件；只放在 `config.local.toml`（已被 `.gitignore` 忽略）或环境变量里。
 
 ---
 
@@ -51,10 +51,11 @@ OJ/
 
 1. 双击 `run.bat`。
 2. 按提示输入 **OJ 用户名**。
-3. 按提示输入 **目标文件夹**（直接回车 = `output`）。
-4. 等待抓取完成。窗口会显示新增/更新/跳过的题目数量。
+3. 按提示输入 **OJ 密码**（`getpass`，输入不回显；已配置 `BMEOJ_PASSWORD` 或 `config.local.toml` 时不会重复询问）。
+4. 按提示输入 **目标文件夹**（直接回车 = `output`）。
+5. 等待登录、抓取完成。窗口会显示鉴权方式、新增/更新/跳过的题目数量。
 
-`run.bat` 会自动寻找 Python（`BMEOJ_PYTHON` → `.venv` → `py -3` → `python`），设置 UTF-8，并在结束时暂停。
+`run.bat` 会自动寻找 Python（`BMEOJ_PYTHON` → `.venv` → `py -3` → `python`），设置 UTF-8，并在结束时暂停。**密码由 Python 在进程内读取，不会写进 `.bat`，也不会出现在批处理命令行里。**
 
 ### 方式二：命令行
 
@@ -74,52 +75,67 @@ python files\bmeoj_archive.py --user 11226128 --dir output
 run.bat --probe --user 11226128
 ```
 
-探测模式会检查：用户是否存在、提交列表能否解析、源码页是否需要 Cookie，并把关键页面结构打印出来。它**不会**写入任何提交文件。
+探测模式会检查：用户是否存在、登录是否成功、会话状态、提交列表能否解析、源码页是否可读，并把关键页面结构打印出来。它**不会**写入任何提交文件，也不会创建目标目录。
 
 ---
 
-## 配置 Cookie
+## 登录与凭据
 
-没有 Cookie 时，工具仍然可以列出公开的提交记录，但**无法读取源码**（OJ 会返回 `I am sorry, You could not view this code!`）。此时脚本会给出明确提示并以退出码 `4` 结束，不会崩溃。
+### 密码登录（推荐）
 
-本工具**不实现登录流程**，也不需要 CSRF token：它只复用你浏览器里已经登录的 Cookie，不会提交账号密码。
+工具按 HUSTOJ 的正常流程登录：先 `GET loginpage.php` 解析表单，再 `POST login.php`。如果登录页在浏览器端用 MD5 处理密码（`jsMd5()` / `hex_md5`），工具会按同样的 UTF-8 MD5 提交；否则提交明文。登录后用 `modifypage.php` 验证会话，确认成功才开始抓取。任何一步失败都会明确报错，不会静默继续。
 
-### 从浏览器复制
+密码来源优先级（从高到低）：
 
-1. 用浏览器登录 `http://oj.bmeonline.cn/`。
-2. 按 `F12` 打开开发者工具。
-3. 打开 **Network（网络）**，刷新任意页面，点一个请求。
-4. 在 **Request Headers（请求头）** 里找到 `Cookie:`，复制整行值（通常形如 `PHPSESSID=...`）。
-5. 不要把 Cookie 粘贴到聊天、Issue、截图或代码里。
+1. 环境变量 `BMEOJ_PASSWORD`
+2. `config.local.toml` 的 `[oj] password`
+3. 交互式终端中的 `getpass` 提示（输入不回显）
 
-### 三种配置方式（任选其一）
+用户名仍用 `--user`；不提供时交互提示。命令行**不提供** `--password`，避免密码进入 shell 历史。
 
-**A. 环境变量（推荐，临时）**
+```bat
+:: 推荐：交互输入，不落到任何文件
+run.bat --user 11226128 --dir output
+
+:: CI/临时：环境变量（注意不要写进脚本或仓库）
+set BMEOJ_PASSWORD=你的密码
+run.bat --user 11226128
+```
+
+`config.local.toml`（与脚本同目录；发行包在 `files\`；已被 `.gitignore` 忽略）：
+
+```toml
+[oj]
+password = "你的 OJ 密码"
+```
+
+`config.toml` 里出现 `password` / `cookie` 会直接报错退出（退出码 `2`），避免误提交。
+
+### Cookie 备选方式（可选）
+
+如果不想让脚本处理密码，仍可复用浏览器会话：用浏览器登录 `http://oj.bmeonline.cn/`，按 `F12` 打开开发者工具，在 **Network（网络）** 里点一个请求，从 **Request Headers** 复制 `Cookie:` 整行值（通常形如 `PHPSESSID=...`）。
+
+Cookie 来源优先级：`BMEOJ_COOKIE` > `config.local.toml` 的 `[oj] cookie`。**只要配置了 Cookie，工具就优先用 Cookie 并跳过密码登录**；Cookie 无效时退出码 `4`，不会回退去猜密码。
 
 ```bat
 set BMEOJ_COOKIE=PHPSESSID=你的值
 run.bat --user 11226128
 ```
 
-PowerShell：
+### 退出码与错误区分
 
-```powershell
-$env:BMEOJ_COOKIE = "PHPSESSID=你的值"
-.\run.bat --user 11226128
-```
+- 用户名不存在：退出码 `5`（`userinfo.php` 返回 `No such User!`）。
+- 密码错误 / 登录失败 / Cookie 失效：退出码 `4`。
+- 登录成功、但某条源码无权查看：打印「登录成功，但 OJ 拒绝查看提交 ...」，不写入该文件；如果全部被拒则退出码 `4`。
+- 会话在下载中途失效：立即停止，退出码 `4`，并保证不写入半套提交文件。
 
-**B. `config.local.toml`（推荐，长期）**
+### 凭据安全
 
-在**脚本所在目录**新建 `config.local.toml`（发行包为 `files\config.local.toml`；已被 `.gitignore` 忽略）：
-
-```toml
-[oj]
-cookie = "PHPSESSID=你的值"
-```
-
-**C. `config.toml` 里禁止放 Cookie**
-
-脚本检测到 `config.toml` 出现 `cookie` 或 `password` 会直接报错退出，避免误提交。
+- 不要提交 `config.local.toml`、`.cookie`、日志、`_backup/`；工具生成的 `.gitignore` 已包含这些路径。
+- 不要把 `BMEOJ_PASSWORD` 写进 `run.bat`、README、Issue、截图或任何会提交的脚本。
+- 在共享电脑上优先用交互式 `getpass`；用完环境变量后清除（`set BMEOJ_PASSWORD=` / `Remove-Item Env:BMEOJ_PASSWORD`）。
+- 日志会对密码、Cookie、Token 做脱敏；但请不要主动把凭据贴进聊天或 Issue。
+- 本工具不实现验证码绕过；登录页要求验证码时会明确拒绝，请改用 Cookie。
 
 优先级：**命令行参数 > 环境变量 > `config.local.toml` > `config.toml` > 内置默认值**。
 
@@ -227,11 +243,14 @@ run.bat --user 11226128 --force
 :: 允许覆盖本地已有 .cpp（不强制重下未变化的提交）
 run.bat --user 11226128 --overwrite
 
-:: 只列计划，不下载、不写文件
+:: 只列计划，不下载、不写文件（仍会验证登录）
 run.bat --user 11226128 --dry-run
 
-:: 探测页面结构 / 检查 Cookie
+:: 验证登录 / 检查页面结构（不写提交文件）
 run.bat --probe --user 11226128
+
+:: 登录失败时保存页面结构，便于排查
+run.bat --probe --user 11226128 --dump-html
 
 :: 指定要探测的提交
 run.bat --probe --user 11226128 --sid 86958
@@ -280,7 +299,7 @@ run.bat --user 11226128 --no-titles
 ```json
 {
   "schema_version": 1,
-  "tool": { "name": "bmeoj_archive.py", "version": "1.0.0" },
+  "tool": { "name": "bmeoj_archive.py", "version": "1.1.0" },
   "generated_at": "2026-11-23T12:00:00+08:00",
   "source": {
     "base_url": "http://oj.bmeonline.cn",
@@ -391,12 +410,16 @@ write_manifest_csv = true
 write_repo_files = true
 ```
 
-`config.local.toml` 与脚本同目录，只放私有内容（Cookie），不要提交：
+`config.local.toml` 与脚本同目录，只放私有凭据，不要提交；密码和 Cookie 二选一（Cookie 优先）：
 
 ```toml
 [oj]
-cookie = "PHPSESSID=..."
+password = "你的 OJ 密码"
+# 或者改用浏览器 Cookie：
+# cookie = "PHPSESSID=..."
 ```
+
+`config.toml` 是可提交的公共配置，**不能**出现 `password` / `cookie`；脚本会在启动时直接报错退出。
 
 ---
 
@@ -404,19 +427,23 @@ cookie = "PHPSESSID=..."
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
-| 退出码 `4`，提示需要 Cookie | 未配置 Cookie，或 Cookie 已过期。按上文重新复制；确认 Cookie 属于目标用户。 |
-| `I am sorry, You could not view this code!` | 未登录、Cookie 失效，或该提交不属于当前账号。工具不会绕过权限。 |
+| 退出码 `4`，提示未提供 OJ 密码 | 非交互环境且没有配置凭据。设置 `BMEOJ_PASSWORD`、`config.local.toml` 的 `[oj] password`，或在交互终端运行让 `getpass` 提示。 |
+| 退出码 `4`，提示用户名或密码错误 | 检查 OJ 用户名/密码；连续失败可能触发临时锁定。工具不会猜测密码，也不会绕过验证码。 |
+| 退出码 `4`，提示 Cookie 无效/已过期 | 重新复制 Cookie，或删除 Cookie 改用密码登录。Cookie 配好后会优先于密码。 |
+| 退出码 `4`，提示“登录成功，但 OJ 拒绝查看源码” | 该提交可能不属于当前账号，或站点限制了源码可见性。工具不会绕过权限。 |
+| `I am sorry, You could not view this code!` | 未登录、会话失效，或该提交不属于当前账号。先运行 `--probe` 看会话状态，再检查 Cookie/密码。 |
+| 登录页要求验证码 | 工具不绕过验证码。请在浏览器手动登录后改用 Cookie 方式。 |
 | 退出码 `5`，用户不存在 | 检查用户名；`userinfo.php` 返回 `No such User!`。 |
 | 提示“没有 AC/正确提交” | 该用户确实没有 AC，或提交被隐藏。先用浏览器确认。 |
 | 题名是“题 1011 PA”占位符 | 题名页抓取失败。可用 `--probe --dump-html` 查看页面；不影响源码归档。 |
-| 页面解析为 0 行 | OJ 页面结构可能变化。运行 `--probe --dump-html`，把 `_debug/` 里的 HTML 拿出来对照 `parse_status_page()`，不要猜接口。 |
+| 页面解析为 0 行 | OJ 页面结构可能变化。运行 `--probe --dump-html`，把 `_debug/` 里的 HTML 拿出来对照 `parse_status_page()` / `parse_login_form()`，不要猜接口。 |
 | 请求超时 / 429 / 403 | 调大 `--interval`（如 `--interval 3`），减少并发；工具本身是串行的。 |
 | `config.toml` 解析失败 | 需要 Python 3.11+ 的 `tomllib`；或安装 `tomli`；或删掉配置文件改用命令行参数。 |
 | 中文乱码 | 用 `run.bat`（已 `chcp 65001`）；或先执行 `chcp 65001`。 |
 | `git` 未找到 | 安装 Git for Windows，或把 `git.exe` 加入 PATH。 |
 | 覆盖后想找回旧文件 | 看 `_backup/<时间戳>/`。 |
 
-退出码：`0` 成功 / `2` 配置或参数 / `3` 网络 / `4` Cookie 或权限 / `5` 用户不存在 / `130` 用户取消。
+退出码：`0` 成功 / `2` 配置或参数 / `3` 网络 / `4` 登录失败、Cookie 失效或权限 / `5` 用户不存在 / `130` 用户取消。
 
 ---
 
@@ -434,13 +461,13 @@ cookie = "PHPSESSID=..."
 
 | 文件 | 作用 |
 | --- | --- |
-| `run.bat` | Windows 启动器：找 Python、设 UTF-8、交互提示、透传参数。 |
+| `run.bat` | Windows 启动器：找 Python、设 UTF-8、交互提示用户名/目标目录；密码由 Python 的 `getpass` 提示（不回显），不写入批处理。 |
 | `files/bmeoj_archive.py` | 核心脚本：抓取、解析、去重、写文件、生成清单和仓库文件（源码布局中位于根目录）。 |
 | `files/config.example.toml` | 公共配置示例（源码布局中位于根目录）。 |
 | `files/requirements.txt` | 说明零必需依赖；可选依赖仅作注释。 |
 | `README.md` | 本文件。 |
 | `LICENSE` | MIT，仅覆盖工具与文档，不覆盖任何提交源码。 |
-| `.gitignore` | 忽略 Cookie、日志、缓存、备份、输出内容等。 |
+| `.gitignore` | 忽略密码/Cookie 配置、日志、缓存、备份、输出内容等。 |
 | `.gitattributes` | 保持 `run.bat` 为 CRLF，其余文本为 LF。 |
 | `output/` | 默认输出目录（空，保留 `.gitkeep`）。 |
 | `tests/test_offline.py` | 离线 mock OJ 测试，不需要联网。 |

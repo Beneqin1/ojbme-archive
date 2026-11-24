@@ -3,6 +3,8 @@ rem ===========================================================================
 rem  run.bat - Windows launcher for bmeoj_archive.py
 rem
 rem  Double-click: interactive prompts for OJ user + target folder, then pause.
+rem  Password is prompted by Python getpass (no echo) and never stored in this
+rem  batch file or passed on the command line. Cookie via BMEOJ_COOKIE still works.
 rem  Command line:  run.bat --user 11226128 --dir output --init-git
 rem
 rem  This launcher NEVER runs git push and NEVER creates a remote repository.
